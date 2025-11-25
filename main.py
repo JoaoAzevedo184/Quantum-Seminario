@@ -10,7 +10,6 @@ from qiskit import QuantumCircuit
 from qiskit.circuit.library import QAOAAnsatz
 from qiskit_algorithms import QAOA
 from qiskit_algorithms.optimizers import COBYLA
-from qiskit.primitives import Sampler
 from qiskit_optimization import QuadraticProgram
 from qiskit_optimization.algorithms import MinimumEigenOptimizer
 from qiskit_optimization.converters import QuadraticProgramToQubo
@@ -49,10 +48,24 @@ class MarketDataFetcher:
                 'range': period
             }
             
+            # Adicionar delay para evitar rate limit
+            import time
+            time.sleep(0.5)
+            
             response = requests.get(f"{base_url}{ticker}", params=params, timeout=10)
+            
+            if response.status_code == 429:
+                print(f"   ⚠️ {ticker}: Limite de requisições atingido (aguarde)")
+                time.sleep(2)
+                return None
             
             if response.status_code == 200:
                 data = response.json()
+                
+                if 'chart' not in data or 'result' not in data['chart']:
+                    print(f"   ✗ {ticker}: Resposta inválida")
+                    return None
+                
                 result = data['chart']['result'][0]
                 
                 # Extrair preços
@@ -68,8 +81,12 @@ class MarketDataFetcher:
                 
                 df = df.dropna()
                 
-                print(f"   ✓ {ticker}: {len(df)} dias de dados")
-                return df
+                if len(df) > 0:
+                    print(f"   ✓ {ticker}: {len(df)} dias de dados")
+                    return df
+                else:
+                    print(f"   ✗ {ticker}: Sem dados válidos")
+                    return None
                 
             else:
                 print(f"   ✗ Erro ao buscar {ticker}: Status {response.status_code}")
@@ -146,16 +163,18 @@ class MarketDataFetcher:
                 if 'results' in data and len(data['results']) > 0:
                     result = data['results'][0]
                     
-                    if 'historicalDataPrice' in result:
+                    if 'historicalDataPrice' in result and len(result['historicalDataPrice']) > 0:
                         prices = result['historicalDataPrice']
                         
                         df = pd.DataFrame(prices)
                         df['date'] = pd.to_datetime(df['date'], unit='s')
                         df = df[['date', 'close']]
                         df = df.sort_values('date')
+                        df = df.dropna()
                         
-                        print(f"   ✓ {clean_ticker}: {len(df)} dias de dados")
-                        return df
+                        if len(df) > 0:
+                            print(f"   ✓ {clean_ticker}: {len(df)} dias de dados")
+                            return df
                 
                 print(f"   ✗ BRAPI: Sem dados para {clean_ticker}")
                 return None
@@ -183,9 +202,11 @@ class MarketDataFetcher:
             
             if source == 'auto':
                 # Tentar múltiplas fontes
-                df = (self.fetch_brapi(ticker) or 
-                      self.fetch_yahoo_finance(ticker, period) or
-                      self.fetch_alpha_vantage(ticker))
+                df = self.fetch_brapi(ticker)
+                if df is None or df.empty:
+                    df = self.fetch_yahoo_finance(ticker, period)
+                if df is None or df.empty:
+                    df = self.fetch_alpha_vantage(ticker)
             elif source == 'yahoo':
                 df = self.fetch_yahoo_finance(ticker, period)
             elif source == 'brapi':
@@ -193,7 +214,7 @@ class MarketDataFetcher:
             elif source == 'alpha_vantage':
                 df = self.fetch_alpha_vantage(ticker)
             
-            if df is not None and len(df) > 0:
+            if df is not None and not df.empty:
                 data_dict[ticker] = df
         
         if len(data_dict) == 0:
@@ -248,7 +269,8 @@ class PortfolioData:
         returns_dict = {}
         
         for ticker, df in market_data.items():
-            df = df.sort_values('date')
+            df = df.sort_values('date').copy()
+            df = df.set_index('date')  # Define data como índice
             df['returns'] = df['close'].pct_change()
             returns_dict[ticker] = df['returns'].dropna()
             
@@ -258,8 +280,14 @@ class PortfolioData:
         
         # Estatísticas
         print(f"   • Período analisado: {len(all_returns)} dias")
-        print(f"   • Data início: {all_returns.index[0].strftime('%d/%m/%Y')}")
-        print(f"   • Data fim: {all_returns.index[-1].strftime('%d/%m/%Y')}")
+        
+        # Verificar se o índice é datetime
+        if isinstance(all_returns.index[0], pd.Timestamp):
+            print(f"   • Data início: {all_returns.index[0].strftime('%d/%m/%Y')}")
+            print(f"   • Data fim: {all_returns.index[-1].strftime('%d/%m/%Y')}")
+        else:
+            print(f"   • Índice inicial: {all_returns.index[0]}")
+            print(f"   • Índice final: {all_returns.index[-1]}")
         
         # Retornos esperados anualizados (%)
         self.expected_returns = (all_returns.mean() * 252 * 100).values
@@ -355,29 +383,164 @@ class QuantumPortfolioOptimizer:
         """
         print("🔬 Iniciando otimização quântica com QAOA...")
         
-        # Criar problema QUBO
-        qp = self.create_qubo_problem()
-        print(f"\n📊 Problema criado: {self.n_assets} ativos")
+        try:
+            # Criar problema QUBO
+            qp = self.create_qubo_problem()
+            print(f"\n📊 Problema criado: {self.n_assets} ativos")
+            
+            # Converter para QUBO
+            converter = QuadraticProgramToQubo()
+            qubo = converter.convert(qp)
+            
+            # Configurar otimizador
+            optimizer = COBYLA(maxiter=100)
+            
+            # Tentar usar SamplingVQE com primitives v2
+            sampler = None
+            sampler_name = "desconhecido"
+            
+            try:
+                # Tentar v2 API (mais recente)
+                from qiskit_aer.primitives import SamplerV2
+                sampler = SamplerV2()
+                sampler_name = "Aer SamplerV2"
+                print(f"   ✓ Usando: {sampler_name}")
+            except ImportError:
+                pass
+            
+            if sampler is None:
+                try:
+                    # Tentar v1 API (compatibilidade)
+                    from qiskit_aer.primitives import Sampler
+                    from qiskit.utils import algorithm_globals
+                    
+                    # Configurar seed para reprodutibilidade
+                    algorithm_globals.random_seed = 42
+                    sampler = Sampler()
+                    sampler_name = "Aer Sampler V1"
+                    print(f"   ✓ Usando: {sampler_name}")
+                except Exception as e:
+                    print(f"   ⚠️ Erro ao criar Sampler V1: {e}")
+            
+            if sampler is None:
+                raise ImportError(
+                    "❌ Não foi possível criar um Sampler compatível.\n"
+                    "Execute: pip install --upgrade qiskit-aer"
+                )
+            
+            # Criar QAOA com configuração adaptada
+            from qiskit_algorithms import SamplingVQE
+            from qiskit.circuit.library import TwoLocal
+            
+            print("   🔄 Configurando circuito variacional...")
+            
+            # Criar ansatz manualmente para maior compatibilidade
+            num_qubits = qubo.num_vars
+            ansatz = TwoLocal(
+                num_qubits=num_qubits,
+                rotation_blocks='ry',
+                entanglement_blocks='cz',
+                entanglement='linear',
+                reps=reps
+            )
+            
+            print(f"   📐 Circuito: {num_qubits} qubits, {reps} camadas")
+            
+            # Usar SamplingVQE em vez de QAOA direto (mais robusto)
+            vqe = SamplingVQE(
+                sampler=sampler,
+                ansatz=ansatz,
+                optimizer=optimizer
+            )
+            
+            print("   ⚙️ Executando otimização quântica...")
+            
+            # Resolver usando MinimumEigenOptimizer
+            qaoa_optimizer = MinimumEigenOptimizer(vqe)
+            result = qaoa_optimizer.solve(qubo)
+            
+            return result, qp
+            
+        except Exception as e:
+            import traceback
+            print(f"\n❌ Erro na otimização quântica: {str(e)}")
+            print("\n📋 Detalhes:")
+            traceback.print_exc()
+            
+            print("\n💡 Tentando método alternativo (clássico)...")
+            try:
+                # Fallback para método clássico
+                from qiskit_optimization.algorithms import CplexOptimizer
+                try:
+                    solver = CplexOptimizer()
+                    result = solver.solve(qp)
+                    print("   ✓ Usando solver CPLEX")
+                    return result, qp
+                except:
+                    pass
+                
+                # Se CPLEX não estiver disponível, usar força bruta
+                print("   ⚙️ Usando método de enumeração...")
+                result = self._brute_force_solve(qp)
+                return result, qp
+                
+            except Exception as e2:
+                print(f"\n❌ Método alternativo também falhou: {e2}")
+                print("\n💡 Use dados simulados: USE_REAL_DATA = False")
+                raise e
+    
+    def _brute_force_solve(self, qp):
+        """Solução por força bruta para problemas pequenos"""
+        from qiskit_optimization import QuadraticProgramElement
+        import itertools
         
-        # Converter para QUBO
-        converter = QuadraticProgramToQubo()
-        qubo = converter.convert(qp)
+        n = qp.get_num_vars()
+        best_solution = None
+        best_value = float('inf')
         
-        # Configurar QAOA
-        optimizer = COBYLA(maxiter=100)
-        sampler = Sampler()
+        print(f"   🔍 Avaliando {2**n} combinações possíveis...")
         
-        qaoa = QAOA(
-            sampler=sampler,
-            optimizer=optimizer,
-            reps=reps
-        )
+        # Testar todas as combinações
+        for bits in itertools.product([0, 1], repeat=n):
+            # Avaliar função objetivo
+            value = 0
+            x = np.array(bits)
+            
+            # Termos lineares
+            for i in range(n):
+                coef = qp.objective.linear.to_dict().get(i, 0)
+                value += coef * x[i]
+            
+            # Termos quadráticos
+            quad_dict = qp.objective.quadratic.to_dict()
+            for (i, j), coef in quad_dict.items():
+                value += coef * x[i] * x[j]
+            
+            # Verificar restrições
+            valid = True
+            for constraint in qp.linear_constraints:
+                lhs = sum(constraint.linear.to_dict().get(i, 0) * x[i] for i in range(n))
+                
+                if constraint.sense.name == 'GE' and lhs < constraint.rhs:
+                    valid = False
+                elif constraint.sense.name == 'LE' and lhs > constraint.rhs:
+                    valid = False
+                elif constraint.sense.name == 'EQ' and lhs != constraint.rhs:
+                    valid = False
+            
+            if valid and value < best_value:
+                best_value = value
+                best_solution = x
         
-        # Resolver com QAOA
-        qaoa_optimizer = MinimumEigenOptimizer(qaoa)
-        result = qaoa_optimizer.solve(qubo)
+        # Criar objeto de resultado
+        class BruteForceResult:
+            def __init__(self, x, fval):
+                self.x = x
+                self.fval = fval
+                self.status = 'SUCCESS'
         
-        return result, qp
+        print(f"   ✓ Melhor solução encontrada: valor = {best_value:.4f}")
+        return BruteForceResult(best_solution, best_value)
     
     def interpret_result(self, result):
         """Interpreta resultado quântico e calcula alocação"""
@@ -576,11 +739,11 @@ def main():
     PERIOD = '1y'  # Período de análise
     
     # Ativos para análise (ações brasileiras)
-    TICKERS = ['PETR4', 'VALE3', 'ITUB4', 'BBDC4', 'WEGE3']
+    TICKERS = ['PETR4', 'VALE3', 'ITUB4']  # Reduzido para evitar rate limit
     
     # API Key (opcional - apenas para Alpha Vantage)
     # Obtenha gratuitamente em: https://www.alphavantage.co/support/#api-key
-    ALPHA_VANTAGE_KEY = None  # Cole sua chave aqui se tiver
+    ALPHA_VANTAGE_KEY = '0WROG596M74RDAA5'  # Sua chave API
     
     print(f"\n⚙️ Parâmetros:")
     print(f"   • Orçamento: R$ {BUDGET:,.2f}")
